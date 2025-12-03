@@ -1,0 +1,227 @@
+package main
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"log"
+)
+
+type BankService struct {
+	db *sql.DB
+}
+
+// 转账请求
+type TransferRequest struct {
+	FromAccountID int64
+	ToAccountID   int64
+	Amount        float64
+}
+
+// 初始化数据库连接
+func NewBankService(dataSourceName string) (*BankService, error) {
+	db, err := sql.Open("mysql", dataSourceName)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
+
+	return &BankService{db: db}, nil
+}
+
+// 执行转账事务
+func (bs *BankService) TransferMoney(req TransferRequest) error {
+	// 开始事务
+	tx, err := bs.db.Begin()
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %v", err)
+	}
+
+	// 确保在函数返回时处理事务
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			panic(p) // 重新抛出 panic
+		} else if err != nil {
+			tx.Rollback() // 错误时回滚
+		} else {
+			err = tx.Commit() // 提交事务
+		}
+	}()
+
+	// 验证基本参数
+	if err := bs.validateTransferRequest(req); err != nil {
+		return err
+	}
+
+	// 检查账户是否存在
+	if err := bs.checkAccountExists(tx, req.FromAccountID, "转出账户"); err != nil {
+		return err
+	}
+	if err := bs.checkAccountExists(tx, req.ToAccountID, "转入账户"); err != nil {
+		return err
+	}
+
+	// 检查余额是否足够
+	if err := bs.checkBalanceSufficient(tx, req.FromAccountID, req.Amount); err != nil {
+		return err
+	}
+
+	// 执行转账操作
+	if err := bs.executeTransfer(tx, req); err != nil {
+		return err
+	}
+
+	fmt.Printf("转账成功: 从账户 %d 向账户 %d 转账 %.2f 元\n",
+		req.FromAccountID, req.ToAccountID, req.Amount)
+	return nil
+}
+
+// 验证转账请求参数
+func (bs *BankService) validateTransferRequest(req TransferRequest) error {
+	if req.FromAccountID <= 0 || req.ToAccountID <= 0 {
+		return errors.New("账户ID必须大于0")
+	}
+
+	if req.FromAccountID == req.ToAccountID {
+		return errors.New("不能向自己转账")
+	}
+
+	if req.Amount <= 0 {
+		return errors.New("转账金额必须大于0")
+	}
+
+	return nil
+}
+
+// 检查账户是否存在
+func (bs *BankService) checkAccountExists(tx *sql.Tx, accountID int64, accountType string) error {
+	var exists bool
+	query := "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?)"
+	err := tx.QueryRow(query, accountID).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("检查%s存在失败: %v", accountType, err)
+	}
+
+	if !exists {
+		return fmt.Errorf("%s不存在", accountType)
+	}
+
+	return nil
+}
+
+// 检查余额是否足够
+func (bs *BankService) checkBalanceSufficient(tx *sql.Tx, fromAccountID int64, amount float64) error {
+	var currentBalance float64
+	query := "SELECT balance FROM accounts WHERE id = ? FOR UPDATE"
+	err := tx.QueryRow(query, fromAccountID).Scan(&currentBalance)
+	if err != nil {
+		return fmt.Errorf("查询余额失败: %v", err)
+	}
+
+	if currentBalance < amount {
+		return fmt.Errorf("账户余额不足。当前余额: %.2f, 需要金额: %.2f", currentBalance, amount)
+	}
+
+	return nil
+}
+
+// 执行转账操作
+func (bs *BankService) executeTransfer(tx *sql.Tx, req TransferRequest) error {
+	// 从转出账户扣款
+	updateFromSQL := "UPDATE accounts SET balance = balance - ? WHERE id = ?"
+	result, err := tx.Exec(updateFromSQL, req.Amount, req.FromAccountID)
+	if err != nil {
+		return fmt.Errorf("扣款失败: %v", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("获取影响行数失败: %v", err)
+	}
+	if rowsAffected != 1 {
+		return errors.New("扣款操作影响行数异常")
+	}
+
+	// 向转入账户存款
+	updateToSQL := "UPDATE accounts SET balance = balance + ? WHERE id = ?"
+	result, err = tx.Exec(updateToSQL, req.Amount, req.ToAccountID)
+	if err != nil {
+		return fmt.Errorf("存款失败: %v", err)
+	}
+
+	rowsAffected, err = result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("获取影响行数失败: %v", err)
+	}
+	if rowsAffected != 1 {
+		return errors.New("存款操作影响行数异常")
+	}
+
+	// 记录交易流水
+	insertSQL := `
+		INSERT INTO transactions (from_account_id, to_account_id, amount) 
+		VALUES (?, ?, ?)`
+	_, err = tx.Exec(insertSQL, req.FromAccountID, req.ToAccountID, req.Amount)
+	if err != nil {
+		return fmt.Errorf("记录交易流水失败: %v", err)
+	}
+
+	return nil
+}
+
+// 查询账户余额
+func (bs *BankService) GetAccountBalance(accountID int64) (float64, error) {
+	var balance float64
+	query := "SELECT balance FROM accounts WHERE id = ?"
+	err := bs.db.QueryRow(query, accountID).Scan(&balance)
+	if err != nil {
+		return 0, fmt.Errorf("查询余额失败: %v", err)
+	}
+	return balance, nil
+}
+
+func main() {
+	// 数据库连接配置
+	dataSourceName := "user:password@tcp(localhost:3306)/bank?charset=utf8&parseTime=True&loc=Local"
+
+	// 初始化银行服务
+	bankService, err := NewBankService(dataSourceName)
+	if err != nil {
+		log.Fatal("初始化银行服务失败:", err)
+	}
+	defer bankService.db.Close()
+
+	// 测试转账
+	transferReq := TransferRequest{
+		FromAccountID: 1,
+		ToAccountID:   2,
+		Amount:        100.00,
+	}
+
+	// 查询转账前余额
+	fromBalanceBefore, _ := bankService.GetAccountBalance(transferReq.FromAccountID)
+	toBalanceBefore, _ := bankService.GetAccountBalance(transferReq.ToAccountID)
+
+	fmt.Printf("转账前余额 - 账户%d: %.2f, 账户%d: %.2f\n",
+		transferReq.FromAccountID, fromBalanceBefore,
+		transferReq.ToAccountID, toBalanceBefore)
+
+	// 执行转账
+	err = bankService.TransferMoney(transferReq)
+	if err != nil {
+		log.Printf("转账失败: %v", err)
+		return
+	}
+
+	// 查询转账后余额
+	fromBalanceAfter, _ := bankService.GetAccountBalance(transferReq.FromAccountID)
+	toBalanceAfter, _ := bankService.GetAccountBalance(transferReq.ToAccountID)
+
+	fmt.Printf("转账后余额 - 账户%d: %.2f, 账户%d: %.2f\n",
+		transferReq.FromAccountID, fromBalanceAfter,
+		transferReq.ToAccountID, toBalanceAfter)
+}
